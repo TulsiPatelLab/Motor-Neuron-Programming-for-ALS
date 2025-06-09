@@ -1,0 +1,471 @@
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+
+#ctrl = control
+#OE = Treatment with Isl1+Lhx3
+
+ctrl.multi <- Read10X_h5("HT006_cellranger_count_outs/filtered_feature_bc_matrix.h5")
+OE.multi <- Read10X_h5("HT004_cellranger_count_outs/filtered_feature_bc_matrix.h5")
+
+ctrl.data <- ctrl.multi$`Gene Expression`
+OE.data <- OE.multi$`Gene Expression`
+ctrl.atac <- ctrl.multi$Peaks
+OE.atac <- OE.multi$Peaks
+
+# Set up control object
+ctrl <- CreateSeuratObject(counts = ctrl.data, project = "P21_CTRL", min.cells = 5)
+grange.counts <- StringToGRanges(rownames(ctrl.atac), sep = c(":", "-"))
+grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+ctrl.atac <- ctrl.atac[as.vector(grange.use), ]
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "mm10"
+
+frag.file <- "HT006_cellranger_count_outs/atac_fragments.tsv.gz"
+chrom_assay <- CreateChromatinAssay(
+  counts = ctrl.atac,
+  sep = c(":", "-"),
+  genome = 'mm10',
+  fragments = frag.file,
+  min.cells = 10,
+  annotation = annotations
+)
+ctrl[["ATAC"]] <- chrom_assay
+
+VlnPlot(ctrl, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2)
+
+ctrl$OE <- "CTRL"
+ctrl <- subset(
+  x = ctrl,
+  subset = nCount_ATAC < 7e4 &
+    nCount_ATAC > 5e3 &
+    nCount_RNA < 25000 &
+    nCount_RNA > 5000 
+)
+ctrl <- NormalizeData(ctrl, verbose = FALSE)
+ctrl <- FindVariableFeatures(ctrl, selection.method = "vst", nfeatures = 2000)
+
+# Set up OE object
+OE <- CreateSeuratObject(counts = OE.data, project = "P21_OE", min.cells = 5)
+
+grange.counts <- StringToGRanges(rownames(OE.atac), sep = c(":", "-"))
+grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+OE.atac <- OE.atac[as.vector(grange.use), ]
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "mm10"
+
+frag.file <- "HT004_cellranger_count_outs/atac_fragments.tsv.gz"
+chrom_assay <- CreateChromatinAssay(
+  counts = OE.atac,
+  sep = c(":", "-"),
+  genome = 'mm10',
+  fragments = frag.file,
+  min.cells = 10,
+  annotation = annotations
+)
+OE[["ATAC"]] <- chrom_assay
+
+ctrl$OE <- "CTRL"
+OE$OE <- "OE"
+OE <- subset(
+  x = OE,
+  subset = nCount_ATAC < 7e4 &
+    nCount_ATAC > 5e3 &
+    nCount_RNA < 25000 &
+    nCount_RNA > 5000 
+)
+OE <- NormalizeData(OE, verbose = FALSE)
+OE <- FindVariableFeatures(OE, selection.method = "vst", nfeatures = 2000)
+
+
+# call peaks using MACS2 for ctrl object
+DefaultAssay(ctrl) <- "ATAC"
+peaks <- CallPeaks(ctrl, macs2.path = "/.../miniconda3/envs/snseq/bin/macs2")
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_mm10, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(ctrl),
+  features = peaks,
+  cells = colnames(ctrl)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+ctrl[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = frag.file,
+  annotation = annotations
+)
+
+
+# call peaks using MACS2 for OE object
+DefaultAssay(OE) <- "ATAC"
+peaks <- CallPeaks(OE, macs2.path = "/.../miniconda3/envs/snseq/bin/macs2")
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_mm10, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(OE),
+  features = peaks,
+  cells = colnames(OE)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+OE[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = frag.file,
+  annotation = annotations
+)
+
+
+#Merge objects based on RNA-seq data using CCA
+
+DefaultAssay(ctrl) <- "RNA"
+DefaultAssay(OE) <- "RNA"
+
+P21.anchors <- FindIntegrationAnchors(object.list = list(ctrl, OE), dims = 1:20)
+P21.combined.multi <- IntegrateData(anchorset = P21.anchors, dims = 1:20)
+
+DefaultAssay(P21.combined.multi) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+P21.combined.multi <- ScaleData(P21.combined.multi, verbose = FALSE)
+P21.combined.multi <- RunPCA(P21.combined.multi, npcs = 30, verbose = FALSE)
+# t-SNE and Clustering
+P21.combined.multi <- RunUMAP(P21.combined.multi, reduction = "pca", dims = 1:20)
+P21.combined.multi <- FindNeighbors(P21.combined.multi, reduction = "pca", dims = 1:20)
+P21.combined.multi <- FindClusters(P21.combined.multi, resolution = 0.5)
+
+# Visualization
+p1 <- DimPlot(P21.combined.multi, reduction = "umap", group.by = "OE", shuffle = T)
+p2 <- DimPlot(P21.combined.multi, reduction = "umap", label = TRUE)
+plot_grid(p1, p2)
+
+#number of cells in ctrl and treatment(OE) for Supplementary Figure 4B
+table(Idents(P21.combined.multi), P21.combined.multi$OE)
+
+#Identify clusters based on gene expression
+features <- c("Tns1", "Bcl6", "Ret", "Zeb2","Nos1", "Smad1", "Pax2", "Pitx2", "Pou6f2")
+features <- c("Gad1", "Slc17a6", "Chat", "Slc5a7")
+features <- c("Aox1", "Grm5", "Creb5", "Rora")
+features <- c("Zeb2", "Nos1")
+FeaturePlot(P21.combined.multi.chol, features = features, min.cutoff = "q9")
+Idents(P21.combined.multi) <- "seurat_clusters"
+P21.combined.multi$celltype <- Idents(P21.combined.multi)
+
+
+#Renaming clusters and storing original cluster names
+Idents(P21.combined.multi) <- "seurat_clusters"
+P21.combined.multi <- RenameIdents(P21.combined.multi, `0` = "E1", `1` = "E2", `2` = "I1", `3` = "C1:Gamma", `4` = "C2:Type3", `5` = "C3", `6` = "E3", `7` = "M1", `8` = "M2", `9` = "C4", `10` = "M3", `11` = "C5:Alpha", `12` = "E4", `13` = "C6", `14` = "I2", `15` = "I3", `16` = "M4", `17` = "C7", `18` = "E5", `19` = "C8", `20` = "M5", `21` = "E6", `22` = "I4", `23` = "C9", `24` = "E7", `25` = "M6", `26` = "M7")
+levels(P21.combined.multi) <- c("C1:Gamma", "C2:Type3", "C3", "C4", "C5:Alpha", "C6", "C7", "C8", "C9", "E1", "E2", "E3","E4","E5","E6", "E7", "I1", "I2", "I3", "I4", "M1", "M2", "M3", "M4", "M5", "M6", "M7")
+
+# Supplementary Figure 2C
+features <- c("Snap25", "Chat", "Slc17a6", "Gad1")
+VlnPlot(P21.combined.multi, features = features, pt.size = 0, combine = T) 
+
+# Visualization for Figure 1E, 1F
+p1 <- DimPlot(P21.combined.multi, reduction = "umap", label = TRUE)
+p2 <- DimPlot(P21.combined.multi, reduction = "umap", group.by = "OE", shuffle = T)
+plot_grid(p1, p2)
+
+#Visualization for Figure 1G (only treatment(OE) clusters shown)
+DefaultAssay(P21.combined.multi) <- "ATAC"
+CoveragePlot(
+  object = P21.combined.multi,
+  region = "chr14-32468177-32469244",
+  extend.upstream = 3000,
+  extend.downstream = 0000,
+  scale.factor = 1e7, split.by = "OE", features = "WPRE-pA"
+)
+
+#alpha,gamma, type3 makers in Supplementary Figure 4D
+features <- c("Stk32a", "Sv2b", "Lypd6", "Tpd52l1", "Adra1a", "Ccdc88c", "Aox1", "Plxdc2", "Chst9", "Pard3b", "Nrp2", "Samd5", "Otof", "Adamts16", "Col27a1", "D5Ertd615e", "Dkk2", "Gpr149", "Trpc5", "Rreb1", "C1qtnf4", "Adamts2", "Cntnap3", "Plcl1")
+
+DotPlot(P21.combined.multi, features = features, cols = c("lightgray", "red")) + RotatedAxis()
+
+#Violin plots of transgene expression in Supplementary Figure 4E
+features <- c("WPRE-pA","chimeric-intron","hIsl1-CDS","hLhx3-CDS")
+plots <- VlnPlot(P21.combined.multi, features = features, split.by = 'OE', pt.size = 0, combine = FALSE, add.noise = F)
+CombinePlots(plots = plots, ncol = 1)
+
+#Differential gene expression in Supplementary Figure 4F
+
+#subsetting 50 cells from each condition because there are only 50 M5_CTRL cells
+a <- subset(P21.combined.multi, subset = `WPRE-pA` > 0 | `chimeric-intron` > 0 | `hIsl1-CDS` > 0 | `hLhx3-CDS` > 0, idents = "C5:Alpha_OE", downsample = 50)
+b <- subset(P21.combined.multi, idents = "C5:Alpha_CTRL", downsample = 50)
+c <- merge(a, y = b, add.cell.id = c("OE", "CTRL"))
+OEonly.Alpha.diff50 <- FindMarkers(c, ident.1 = "C5:Alpha_OE", ident.2 = "C5:Alpha_CTRL", verbose = FALSE)
+
+a <- subset(P21.combined.multi, subset = `WPRE-pA` > 0 | `chimeric-intron` > 0 | `hIsl1-CDS` > 0 | `hLhx3-CDS` > 0, idents = "C2:Type3_OE", downsample = 50)
+b <- subset(P21.combined.multi, idents = "C2:Type3_CTRL", downsample = 50)
+c <- merge(a, y = b, add.cell.id = c("OE", "CTRL"))
+OEonly.Type3.diff50 <- FindMarkers(c, ident.1 = "C2:Type3_OE", ident.2 = "C2:Type3_CTRL", verbose = FALSE)
+
+a <- subset(P21.combined.multi, subset = `WPRE-pA` > 0 | `chimeric-intron` > 0 | `hIsl1-CDS` > 0 | `hLhx3-CDS` > 0, idents = "C1:Gamma_OE", downsample = 50)
+b <- subset(P21.combined.multi, idents = "C1:Gamma_CTRL", downsample = 50)
+c <- merge(a, y = b, add.cell.id = c("OE", "CTRL"))
+OEonly.Gamma.diff50 <- FindMarkers(c, ident.1 = "C1:Gamma_OE", ident.2 = "C1:Gamma_CTRL", verbose = FALSE)
+
+a <- subset(P21.combined.multi, subset = `WPRE-pA` > 0 | `chimeric-intron` > 0 | `hIsl1-CDS` > 0 | `hLhx3-CDS` > 0, idents = "M5_OE", downsample = 50)
+b <- subset(P21.combined.multi, idents = "M5_CTRL", downsample = 50)
+c <- merge(a, y = b, add.cell.id = c("OE", "CTRL"))
+OEonly.M5.diff50 <- FindMarkers(c, ident.1 = "M5_OE", ident.2 = "M5_CTRL", verbose = FALSE)
+
+# counts shown in Supplementary Figure 4F are filtered by p_val_adj < 0.05 (du = up, dd = down)
+du <- dplyr::filter(OEonly.M5.diff50, p_val_adj < 0.05, avg_log2FC > 0)
+dd <- dplyr::filter(OEonly.M5.diff50, p_val_adj < 0.05, avg_log2FC < 0)
+du <- dplyr::filter(OEonly.Alpha.diff50, p_val_adj < 0.05, avg_log2FC > 0)
+dd <- dplyr::filter(OEonly.Alpha.diff50, p_val_adj < 0.05, avg_log2FC < 0)
+du <- dplyr::filter(OEonly.Gamma.diff50, p_val_adj < 0.05, avg_log2FC > 0)
+dd <- dplyr::filter(OEonly.Gamma.diff50, p_val_adj < 0.05, avg_log2FC < 0)
+du <- dplyr::filter(OEonly.Type3.diff50, p_val_adj < 0.05, avg_log2FC > 0)
+dd <- dplyr::filter(OEonly.Type3.diff50, p_val_adj < 0.05, avg_log2FC < 0)
+
+
+#subsetting all cholinergic non MNs
+P21.combined.multi.chol <- subset(x = P21.combined.multi, idents = c("C3","C4", "C6", "C7",  "C8", "C9"))
+DefaultAssay(P21.combined.multi.chol) <- "RNA"
+# Run the standard workflow for visualization and clustering
+P21.combined.multi.chol <- NormalizeData(object = P21.combined.multi.chol)
+P21.combined.multi.chol <- FindVariableFeatures(object = P21.combined.multi.chol)
+P21.combined.multi.chol <- ScaleData(P21.combined.multi.chol, verbose = FALSE)
+P21.combined.multi.chol <- RunPCA(P21.combined.multi.chol, npcs = 30, verbose = FALSE)
+# t-SNE and Clustering
+P21.combined.multi.chol <- RunUMAP(P21.combined.multi.chol, reduction = "pca", dims = 1:15)
+P21.combined.multi.chol <- FindNeighbors(P21.combined.multi.chol, reduction = "pca", dims = 1:15)
+P21.combined.multi.chol <- FindClusters(P21.combined.multi.chol, graph.name = NULL, resolution = 0.5)
+ElbowPlot(P21.combined.multi.chol)
+
+# Visualization for Supplementary Figure 6E, 6F
+p1 <- DimPlot(P21.combined.multi.chol, reduction = "umap", group.by = "OE")
+p2 <- DimPlot(P21.combined.multi.chol, reduction = "umap", label = TRUE)
+plot_grid(p1, p2)
+
+#Number of cells in Supplementary Figure 6D
+table(Idents(P21.combined.multi.chol), P21.combined.multi.chol$OE)
+
+#subsetting all cholinergic skeletal MNs
+#all following is using the subsetted object of only skeletal MNs
+P21.combined.multi.MN <- subset(x = P21.combined.multi, idents = c("C1:Gamma","C2:Type3", "C5:Alpha"))
+
+DefaultAssay(P21.combined.multi.MN) <- "RNA"
+# Run the standard workflow for visualization and clustering
+P21.combined.multi.MN <- NormalizeData(object = P21.combined.multi.MN)
+P21.combined.multi.MN <- FindVariableFeatures(object = P21.combined.multi.MN)
+P21.combined.multi.MN <- ScaleData(P21.combined.multi.MN, verbose = FALSE)
+P21.combined.multi.MN <- RunPCA(P21.combined.multi.MN, npcs = 30, verbose = FALSE)
+# t-SNE and Clustering
+P21.combined.multi.MN <- RunUMAP(P21.combined.multi.MN, reduction = "pca", dims = 1:15)
+P21.combined.multi.MN <- FindNeighbors(P21.combined.multi.MN, reduction = "pca", dims = 1:15)
+P21.combined.multi.MN <- FindClusters(P21.combined.multi.MN, graph.name = NULL, resolution = 0.5)
+ElbowPlot(P21.combined.multi.MN, ndims = 30)
+
+#Visualization for Figure 1H,1I,1J
+p1 <- DimPlot(P21.combined.multi.MN, reduction = "umap", group.by = "OE")
+p2 <- DimPlot(P21.combined.multi.MN, reduction = "umap", group.by = "celltype.OE")
+p3 <- DimPlot(P21.combined.multi.MN, reduction = "umap", label = TRUE)
+p1 | p2 | p3
+VlnPlot(P21.combined.multi.MN, features = "WPRE-pA", pt.size = 0, combine = FALSE, add.noise = F)
+
+#Number of cells in Supplementary Figure 6B
+table(Idents(P21.combined.multi.MN), P21.combined.multi.MN$OE)
+
+#alpha,gamma, type3 makers in Supplementary Figure 6A
+features <- c("Stk32a", "Sv2b", "Lypd6", "Tpd52l1", "Adra1a", "Ccdc88c", "Aox1", "Plxdc2", "Chst9", "Pard3b", "Nrp2", "Samd5", "Otof", "Adamts16", "Col27a1", "D5Ertd615e", "Dkk2", "Gpr149", "Trpc5", "Rreb1", "C1qtnf4", "Adamts2", "Cntnap3", "Plcl1")
+
+DotPlot(P21.combined.multi, features = features, cols = c("lightgray", "red")) + RotatedAxis()
+
+# call peaks using MACS2
+Idents(P21.combined.multi.MN) <- "seurat_clusters"
+DefaultAssay(P21.combined.multi.MN) <- "ATAC"
+peaks <- CallPeaks(P21.combined.multi.MN, macs2.path = "/.../miniconda3/envs/snseq/bin/macs2")
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_mm10, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(P21.combined.multi.MN),
+  features = peaks,
+  cells = colnames(P21.combined.multi.MN)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+P21.combined.multi.MN[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = frag.file,
+  annotation = annotations
+)
+
+#use ChromVAR to add a motif assay
+library(chromVAR)
+library(JASPAR2020)
+library(TFBSTools)
+library(motifmatchr)
+library(BSgenome.Mmusculus.UCSC.mm10)
+
+#different speacies for searching motifs
+#mouse 10090
+#human 9606
+pfm <- getMatrixByID(JASPAR2020, ID="MA0135")
+seqLogo(toICM(pfm))
+
+# Scan the DNA sequence of each peak for the presence of each motif, and create a Motif object
+DefaultAssay(P21.combined.multi.MN) <- "peaks"
+pwm_set <- getMatrixSet(x = JASPAR2020, opts = list(species = 10090, all_versions = FALSE))
+motif.matrix <- CreateMotifMatrix(features = granges(P21.combined.multi.MN), pwm = pwm_set, genome = 'mm10', use.counts = FALSE)
+motif.object <- CreateMotifObject(data = motif.matrix, pwm = pwm_set)
+P21.combined.multi.MN <- SetAssayData(P21.combined.multi.MN, assay = 'peaks', slot = 'motifs', new.data = motif.object)
+
+# Note that this step can take 30-60 minutes 
+P21.combined.multi.MN <- RunChromVAR(
+  object = P21.combined.multi.MN,
+  genome = BSgenome.Mmusculus.UCSC.mm10
+)
+
+#DEGs plotted in Fig. 2A
+DefaultAssay(P21.combined.multi.MN) <- "RNA"
+deg_alpha <- FindMarkers(
+  object = P21.combined.multi.MN,
+  ident.1 = c(8), ident.2 = c(2, 9, 10), logfc.threshold = 0.25, min.pct = 0.01,
+  only.pos = F)
+deg_alpha <- setDT(deg_alpha, keep.rownames = "gene")
+deg_type3 <- FindMarkers(
+  object = P21.combined.multi.MN,
+  ident.1 = c(6), ident.2 = c(0, 7), logfc.threshold = 0.1,
+  only.pos = F)
+deg_type3 <- setDT(deg_type3, keep.rownames = "gene")
+
+
+
+#Differential peaks plotted in Figure 2D
+DefaultAssay(P21.combined.multi.MN) <- "peaks"
+da_peaks_all_alpha <- FindMarkers(
+  object = P21.combined.multi.MN,
+  ident.1 = c(8), ident.2 = c(2, 9, 10),
+  only.pos = F,
+  test.use = 'LR',
+  min.pct = 0.05,
+  latent.vars = 'nCount_peaks'
+)
+da_peaks_all_type3 <- FindMarkers(
+  object = P21.combined.multi.MN,
+  ident.1 = c(6), ident.2 = c(0,7),
+  only.pos = F,
+  test.use = 'LR',
+  min.pct = 0.05,
+  latent.vars = 'nCount_peaks'
+)
+
+da_peaks_all <- FindMarkers(
+  object = P21.combined.multi.MN,
+  ident.1 = c(6, 8), ident.2 = c(2, 9, 7, 10, 0),
+  only.pos = FALSE,
+  test.use = 'LR',
+  min.pct = 0.05,
+  latent.vars = 'nCount_peaks'
+)
+
+da_peaks_all_alpha <- setDT(da_peaks_all_alpha, keep.rownames = "peak") 
+da_peaks_all_type3 <- setDT(da_peaks_all_type3, keep.rownames = "peak")
+da_peaks_all <- setDT(da_peaks_all, keep.rownames = "peak")
+
+
+# get top differentially accessible peaks
+top.da.peak.all.alphaup <- dplyr::filter(da_peaks_all_alpha, avg_log2FC > 0, p_val < 0.05)
+top.da.peak.all.alphadown <- dplyr::filter(da_peaks_all_alpha, avg_log2FC < 0, p_val < 0.05)
+
+top.da.peak.all.type3up <- dplyr::filter(da_peaks_all_type3, avg_log2FC > 0, p_val < 0.05)
+top.da.peak.all.type3down <- dplyr::filter(da_peaks_all_type3, avg_log2FC < 0, p_val < 0.05)
+
+#identifying shared vs. uniqe differential peaks
+top.da.peak.all.sharedup <- merge(top.da.peak.all.alphaup, top.da.peak.all.type3up, by = "peak") 
+rm(top.da.peak.all.shared)
+top.da.peak.all.shareddown <- merge(top.da.peak.all.alphadown, top.da.peak.all.type3down, by = "peak")
+
+
+top.da.peak.all.alphauponly <- dplyr::anti_join(top.da.peak.all.alphaup, top.da.peak.all.sharedup, by = "peak") 
+top.da.peak.all.type3uponly <- dplyr::anti_join(top.da.peak.all.type3up, top.da.peak.all.sharedup, by = "peak") 
+
+#performing motif enrichment including for Figure 2E
+top.da.peak.all.allup <- dplyr::bind_rows(top.da.peak.all.alphauponly, top.da.peak.all.sharedup, top.da.peak.all.type3up)
+write.table(top.da.peak.all.allup, file ="top.da.peak.all.allup.txt", quote = F, sep = "\t", row.names = F)
+
+enriched.motifs.top.da.peak.all.allup <- FindMotifs(object = P21.combined.multi.MN, features = top.da.peak.all.allup$peak)
+MotifPlot(object = P21.combined.multi.MN, motifs = head(rownames(enriched.motifs.top.da.peak.all.allup)))
+
+
+enriched.motifs.alphaup <- FindMotifs(object = P21.combined.multi.MN, features = top.da.peak.all.alphaup$peak)
+enriched.motifs.alphadown <- FindMotifs(object = P21.combined.multi.MN, features = top.da.peak.all.alphadown$peak)
+
+
+enriched.motifs.type3up <- FindMotifs(object = P21.combined.multi.MN, features = top.da.peak.all.type3up$peak)
+enriched.motifs.type3down <- FindMotifs(object = P21.combined.multi.MN, features = top.da.peak.all.type3down$peak)
+
+MotifPlot(object = P21.combined.multi.MN, motifs = head(rownames(enriched.motifs.alphaup)))
+MotifPlot(object = P21.combined.multi.MN, motifs = head(rownames(enriched.motifs.alphadown)))
+MotifPlot(object = P21.combined.multi.MN, motifs = head(rownames(enriched.motifs.type3up)))
+MotifPlot(object = P21.combined.multi.MN, motifs = head(rownames(enriched.motifs.type3down)))
+
+#heatmaps of peaks using Signac for Figure 2D
+data = top.da.peak.all.alphaup$peak
+df <- tibble(original = data) %>% separate(original, into = c("chr", "start", "end"), sep = "-")
+
+peaks_gr <- makeGRangesFromDataFrame(df)
+RegionMatrix <- RegionMatrix(
+  P21.combined.multi.MNL,
+  regions = peaks_gr,
+  key = 'matrix',
+  assay = 'ATAC',
+  group.by = "seurat_clusters", 
+  upstream = 1000,
+  downstream = 1000,
+  verbose = TRUE
+)
+
+RegionHeatmap(
+  RegionMatrix,
+  key = 'matrix',
+  assay = 'ATAC',
+  normalize = TRUE,
+  max.cutoff = "q95",
+  upstream = 1000,
+  downstream = 1000,
+  cols = "blue",
+  min.counts = 1,
+  window = (100)/1,
+  order = TRUE,
+  nrow = NULL
+)
+
+
+#Finding markers for cluster 4 in P21.combined.multi.MN for Supplementary Figure 6c
+
+cluster4.MN <- FindMarkers(P21.combined.multi.MNL, ident.1 = 4, only.pos = F)
+cluster4alpha.MN <- FindMarkers(P21.combined.multi.MNL, ident.1 = c(4, 2, 9, 10), only.pos = F)
+cluster4.MN <- setDT(cluster4.MN, keep.rownames = T) %>% dplyr::rename(gene = rn)
+cluster4alpha.MN <- setDT(cluster4alpha.MN, keep.rownames = T) %>% dplyr::rename(gene = rn)
+features <- cluster4.MN$gene[1:12]
+features <- cluster4alpha.MN$gene[1:12]
+FeaturePlot(P21.combined.multi.MNL, features = features, ncol =3)
+features <- c("Grm5","Trank1", "Plppr1", "Negr1", "Cdh8", "Zfp804b", "Cacna1e", "Stk32a", "Sv2b")
+
+#plot Lhx3 motif prevelance Supplementary Figure 7E
+DefaultAssay(P21.combined.multi.MNL) <- "ATAC"
+motif.name <- ConvertMotifID(P21.combined.multi.MNL, name = "Lhx3")
+FeaturePlot(P21.combined.multi.MNL, features = motif.name, min.cutoff = 0, label = F)
+DotPlot(P21.combined.multi.MNL, features = motif.name)
+
+
+
